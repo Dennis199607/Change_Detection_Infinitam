@@ -1,0 +1,1279 @@
+// Copyright 2014-2017 Oxford University Innovation Limited and the authors of InfiniTAM
+#include <algorithm>
+
+#include "ITMVisualisationEngine_CUDA.h"
+#include "ITMVisualisationHelpers_CUDA.h"
+#include "../../../Objects/Scene/ITMScene.h"
+
+#include "cuda.h"
+#include "cuda_runtime.h"
+#include <math.h>
+
+__device__ int cuda_nrDepthIntervals = 50;
+int nrDepthIntervals = 50;
+
+__device__ const int CUDA_UNDEFINED = 0;
+int UNDEFINED = 0;
+
+__device__ const int CUDA_SEEN = 1;
+int SEEN = 1;
+
+__device__ const int CUDA_UNSEEN = 2;
+int UNSEEN = 2;
+
+__device__ const int CUDA_SURFACE = 3;
+int SURFACE = 3;
+
+__device__ const int CUDA_CHANGE = 4;
+int CHANGE = 4;
+
+using namespace ITMLib;
+
+struct Plane {
+	Vector3f point, u, v, normal;
+	float A, B, C, D;
+};
+
+struct Line {
+	Vector3f point;
+	Vector3f direction;
+};
+
+struct ViewFrustum {
+	Plane nearPlane, farPlane, leftPlane, rightPlane, topPlane, bottomPlane;
+};
+
+inline Vector4f intersectPlaneLine(Plane plane, Line line) {
+	float denominator = plane.A * line.direction.x + plane.B * line.direction.y + plane.C * line.direction.z;
+
+	if (denominator <= 0.01f && denominator >= -0.01f) {
+		return Vector4f(0.0f, 0.0f, 0.0f, -1.0f);
+	}
+
+	float numerator = -(plane.A * line.point.x + plane.B * line.point.y + plane.C * line.point.z + plane.D);
+	float t = numerator / denominator;
+
+	Vector3f intersection = line.point + t * line.direction;
+	return Vector4f(intersection.x, intersection.y, intersection.z, 1.0f);
+}
+
+inline bool pointInsidePlane(Vector3f point, Plane plane) {
+	Vector3f OP = point - plane.point;
+
+
+	float projection_u = dot(OP, plane.u) / length(plane.u);
+	float projection_v = dot(OP, plane.v) / length(plane.v);
+
+	float value_u = projection_u / length(plane.u);
+	float value_v = projection_v / length(plane.v);
+
+	if (value_u >= 0.0f && value_u <= 1.0f && value_v >= 0.0 && value_v <= 1.0) {
+		return true;
+	}
+	else {
+		return false;
+	}
+}
+
+inline dim3 getGridSize(dim3 taskSize, dim3 blockSize)
+{
+	return dim3((taskSize.x + blockSize.x - 1) / blockSize.x, (taskSize.y + blockSize.y - 1) / blockSize.y, (taskSize.z + blockSize.z - 1) / blockSize.z);
+}
+
+inline dim3 getGridSize(Vector2i taskSize, dim3 blockSize) { return getGridSize(dim3(taskSize.x, taskSize.y), blockSize); }
+
+template<class TVoxel, class TIndex>
+ITMVisualisationEngine_CUDA<TVoxel, TIndex>::ITMVisualisationEngine_CUDA(void)
+{
+	ORcudaSafeCall(cudaMalloc((void**)&noTotalPoints_device, sizeof(uint)));
+}
+
+template<class TVoxel, class TIndex>
+ITMVisualisationEngine_CUDA<TVoxel, TIndex>::~ITMVisualisationEngine_CUDA(void)
+{
+	ORcudaSafeCall(cudaFree(noTotalPoints_device));
+}
+
+template<class TVoxel>
+ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::ITMVisualisationEngine_CUDA(void)
+{
+	ORcudaSafeCall(cudaMalloc((void**)&renderingBlockList_device, sizeof(RenderingBlock) * MAX_RENDERING_BLOCKS));
+	ORcudaSafeCall(cudaMalloc((void**)&noTotalBlocks_device, sizeof(uint)));
+	ORcudaSafeCall(cudaMalloc((void**)&noTotalPoints_device, sizeof(uint)));
+	ORcudaSafeCall(cudaMalloc((void**)&noVisibleEntries_device, sizeof(uint)));
+}
+
+template<class TVoxel>
+ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::~ITMVisualisationEngine_CUDA(void)
+{
+	ORcudaSafeCall(cudaFree(noTotalPoints_device));
+	ORcudaSafeCall(cudaFree(noTotalBlocks_device));
+	ORcudaSafeCall(cudaFree(renderingBlockList_device));
+	ORcudaSafeCall(cudaFree(noVisibleEntries_device));
+}
+
+template<class TVoxel, class TIndex>
+ITMRenderState* ITMVisualisationEngine_CUDA<TVoxel, TIndex>::CreateRenderState(const ITMScene<TVoxel, TIndex> *scene, const Vector2i & imgSize) const
+{
+	return new ITMRenderState(
+		imgSize, scene->sceneParams->viewFrustum_min, scene->sceneParams->viewFrustum_max, MEMORYDEVICE_CUDA
+	);
+}
+
+template<class TVoxel>
+ITMRenderState_VH* ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::CreateRenderState(const ITMScene<TVoxel, ITMVoxelBlockHash> *scene, const Vector2i & imgSize) const
+{
+	return new ITMRenderState_VH(
+		ITMVoxelBlockHash::noTotalEntries, imgSize, scene->sceneParams->viewFrustum_min, scene->sceneParams->viewFrustum_max, MEMORYDEVICE_CUDA
+	);
+}
+
+template<class TVoxel, class TIndex>
+void ITMVisualisationEngine_CUDA<TVoxel, TIndex>::FindVisibleBlocks(const ITMScene<TVoxel,TIndex> *scene, const ORUtils::SE3Pose *pose, const ITMIntrinsics *intrinsics, ITMRenderState *renderState) const
+{
+}
+
+template<class TVoxel>
+void ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::FindVisibleBlocks(const ITMScene<TVoxel,ITMVoxelBlockHash> *scene, const ORUtils::SE3Pose *pose, const ITMIntrinsics *intrinsics, ITMRenderState *renderState) const
+{
+	const ITMHashEntry *hashTable = scene->index.GetEntries();
+	int noTotalEntries = scene->index.noTotalEntries;
+	float voxelSize = scene->sceneParams->voxelSize;
+	Vector2i imgSize = renderState->renderingRangeImage->noDims;
+
+	Matrix4f M = pose->GetM();
+	Vector4f projParams = intrinsics->projectionParamsSimple.all;
+
+	ITMRenderState_VH *renderState_vh = (ITMRenderState_VH*)renderState;
+
+	ORcudaSafeCall(cudaMemset(noVisibleEntries_device, 0, sizeof(int)));
+
+	dim3 cudaBlockSizeAL(256, 1);
+	dim3 gridSizeAL((int)ceil((float)noTotalEntries / (float)cudaBlockSizeAL.x));
+	buildCompleteVisibleList_device << <gridSizeAL, cudaBlockSizeAL >> >(hashTable, /*cacheStates, this->scene->useSwapping,*/ noTotalEntries,
+		renderState_vh->GetVisibleEntryIDs(), noVisibleEntries_device, renderState_vh->GetEntriesVisibleType(), M, projParams, 
+		imgSize, voxelSize);
+	ORcudaKernelCheck;
+
+	/*	if (this->scene->useSwapping)
+			{
+			reAllocateSwappedOutVoxelBlocks_device << <gridSizeAL, cudaBlockSizeAL >> >(voxelAllocationList, hashTable, noTotalEntries,
+			noAllocatedVoxelEntries_device, entriesVisibleType);
+			}*/
+
+	ORcudaSafeCall(cudaMemcpy(&renderState_vh->noVisibleEntries, noVisibleEntries_device, sizeof(int), cudaMemcpyDeviceToHost));
+}
+
+template<class TVoxel, class TIndex>
+int ITMVisualisationEngine_CUDA<TVoxel, TIndex>::CountVisibleBlocks(const ITMScene<TVoxel,TIndex> *scene, const ITMRenderState *renderState, int minBlockId, int maxBlockId) const
+{
+	return 1;
+}
+
+template<class TVoxel>
+int ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::CountVisibleBlocks(const ITMScene<TVoxel,ITMVoxelBlockHash> *scene, const ITMRenderState *renderState, int minBlockId, int maxBlockId) const
+{
+	const ITMRenderState_VH *renderState_vh = (const ITMRenderState_VH*)renderState;
+
+	int noVisibleEntries = renderState_vh->noVisibleEntries;
+	const int *visibleEntryIDs_device = renderState_vh->GetVisibleEntryIDs();
+
+	ORcudaSafeCall(cudaMemset(noTotalBlocks_device, 0, sizeof(uint)));
+
+	dim3 blockSize(256);
+	dim3 gridSize((int)ceil((float)noVisibleEntries / (float)blockSize.x));
+
+	const ITMHashEntry *hashTable_device = scene->index.GetEntries();
+	countVisibleBlocks_device<<<gridSize,blockSize>>>(visibleEntryIDs_device, noVisibleEntries, hashTable_device, noTotalBlocks_device, minBlockId, maxBlockId);
+	ORcudaKernelCheck;
+
+	uint noTotalBlocks;
+	ORcudaSafeCall(cudaMemcpy(&noTotalBlocks, noTotalBlocks_device, sizeof(uint), cudaMemcpyDeviceToHost));
+
+	return noTotalBlocks;
+}
+
+template<class TVoxel, class TIndex>
+void ITMVisualisationEngine_CUDA<TVoxel, TIndex>::CreateExpectedDepths(const ITMScene<TVoxel,TIndex> *scene, const ORUtils::SE3Pose *pose,
+	const ITMIntrinsics *intrinsics, ITMRenderState *renderState) const
+{
+	Vector2f *minmaxData = renderState->renderingRangeImage->GetData(MEMORYDEVICE_CUDA);
+
+	Vector2f init;
+	//TODO : this could be improved a bit...
+	init.x = 0.2f; init.y = 3.0f;
+	memsetKernel<Vector2f>(minmaxData, init, renderState->renderingRangeImage->dataSize);
+}
+
+template<class TVoxel>
+void ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::CreateExpectedDepths(const ITMScene<TVoxel,ITMVoxelBlockHash> *scene, const ORUtils::SE3Pose *pose, const ITMIntrinsics *intrinsics,
+	ITMRenderState *renderState) const
+{
+	float voxelSize = scene->sceneParams->voxelSize;
+
+	Vector2i imgSize = renderState->renderingRangeImage->noDims;
+	Vector2f *minmaxData = renderState->renderingRangeImage->GetData(MEMORYDEVICE_CUDA);
+
+	Vector2f init;
+	init.x = FAR_AWAY; init.y = VERY_CLOSE;
+	memsetKernel<Vector2f>(minmaxData, init, renderState->renderingRangeImage->dataSize);
+
+	ITMRenderState_VH* renderState_vh = (ITMRenderState_VH*)renderState;
+
+	//go through list of visible 8x8x8 blocks
+	{
+		const ITMHashEntry *hash_entries = scene->index.GetEntries();
+		const int *visibleEntryIDs = renderState_vh->GetVisibleEntryIDs();
+		int noVisibleEntries = renderState_vh->noVisibleEntries;
+		if (noVisibleEntries == 0) return;
+
+		dim3 blockSize(256);
+		dim3 gridSize((int)ceil((float)noVisibleEntries / (float)blockSize.x));
+		ORcudaSafeCall(cudaMemset(noTotalBlocks_device, 0, sizeof(uint)));
+		projectAndSplitBlocks_device << <gridSize, blockSize >> >(hash_entries, visibleEntryIDs, noVisibleEntries, pose->GetM(),
+			intrinsics->projectionParamsSimple.all, imgSize, voxelSize, renderingBlockList_device, noTotalBlocks_device);
+		ORcudaKernelCheck;
+	}
+
+	uint noTotalBlocks;
+	ORcudaSafeCall(cudaMemcpy(&noTotalBlocks, noTotalBlocks_device, sizeof(uint), cudaMemcpyDeviceToHost));
+	if (noTotalBlocks == 0) return;
+	if (noTotalBlocks > (unsigned)MAX_RENDERING_BLOCKS) noTotalBlocks = MAX_RENDERING_BLOCKS;
+
+	// go through rendering blocks
+	{
+		// fill minmaxData
+		dim3 blockSize(16, 16);
+		dim3 gridSize((unsigned int)ceil((float)noTotalBlocks / 4.0f), 4);
+		fillBlocks_device << <gridSize, blockSize >> >(noTotalBlocks, renderingBlockList_device, imgSize, minmaxData);
+		ORcudaKernelCheck;
+	}
+}
+
+template <class TVoxel, class TIndex>
+static void GenericRaycast(const ITMScene<TVoxel, TIndex> *scene, const Vector2i& imgSize, const Matrix4f& invM, const Vector4f& projParams, const ITMRenderState *renderState, bool updateVisibleList)
+{
+	float voxelSize = scene->sceneParams->voxelSize;
+	float oneOverVoxelSize = 1.0f / voxelSize;
+
+	uchar *entriesVisibleType = NULL;
+	if (updateVisibleList&&(dynamic_cast<const ITMRenderState_VH*>(renderState)!=NULL))
+	{
+		entriesVisibleType = ((ITMRenderState_VH*)renderState)->GetEntriesVisibleType();
+	}
+
+	dim3 cudaBlockSize(16, 12);
+	dim3 gridSize((int)ceil((float)imgSize.x / (float)cudaBlockSize.x), (int)ceil((float)imgSize.y / (float)cudaBlockSize.y));
+	if (entriesVisibleType!=NULL) genericRaycast_device<TVoxel, ITMVoxelBlockHash, true> << <gridSize, cudaBlockSize >> >(
+			renderState->raycastResult->GetData(MEMORYDEVICE_CUDA),
+			entriesVisibleType,
+			scene->localVBA.GetVoxelBlocks(),
+			scene->index.getIndexData(),
+			imgSize,
+			invM,
+			InvertProjectionParams(projParams),
+			oneOverVoxelSize,
+			renderState->renderingRangeImage->GetData(MEMORYDEVICE_CUDA),
+			scene->sceneParams->mu
+		);
+	else genericRaycast_device<TVoxel, ITMVoxelBlockHash, false> << <gridSize, cudaBlockSize >> >(
+			renderState->raycastResult->GetData(MEMORYDEVICE_CUDA),
+			NULL,
+			scene->localVBA.GetVoxelBlocks(),
+			scene->index.getIndexData(),
+			imgSize,
+			invM,
+			InvertProjectionParams(projParams),
+			oneOverVoxelSize,
+			renderState->renderingRangeImage->GetData(MEMORYDEVICE_CUDA),
+			scene->sceneParams->mu
+		);
+	ORcudaKernelCheck;
+}
+
+template <class TVoxel, class TIndex>
+static void GenericRaycast_Change(const ITMScene<TVoxel, TIndex>* scene, const Vector2i& imgSize, const Matrix4f& invM, const Vector4f& projParams, const ITMRenderState* renderState, bool updateVisibleList, float* change_from, float* change_to, int* change_voxelTypes, int minX, int minY, int minZ, int maxX, int maxY, int maxZ)
+{
+	float voxelSize = scene->sceneParams->voxelSize;
+	float oneOverVoxelSize = 1.0f / voxelSize;
+
+	/*uchar* entriesVisibleType = NULL;
+	if (updateVisibleList && (dynamic_cast<const ITMRenderState_VH*>(renderState) != NULL))
+	{
+		entriesVisibleType = ((ITMRenderState_VH*)renderState)->GetEntriesVisibleType();
+	}*/
+
+	dim3 cudaBlockSize(16, 12);
+	dim3 gridSize((int)ceil((float)imgSize.x / (float)cudaBlockSize.x), (int)ceil((float)imgSize.y / (float)cudaBlockSize.y));
+	/*if (entriesVisibleType != NULL) genericRaycastChange_device<TVoxel, ITMVoxelBlockHash, true> << <gridSize, cudaBlockSize >> > (
+		renderState->raycastResult->GetData(MEMORYDEVICE_CUDA),
+		entriesVisibleType,
+		scene->localVBA.GetVoxelBlocks(),
+		scene->index.getIndexData(),
+		imgSize,
+		invM,
+		InvertProjectionParams(projParams),
+		oneOverVoxelSize,
+		renderState->renderingRangeImage->GetData(MEMORYDEVICE_CUDA),
+		scene->sceneParams->mu,
+		change_from,
+		change_to,
+		change_voxelTypes,
+		minX, minY, minZ,
+		maxX, maxY, maxZ
+		);
+	else*/ 
+	genericRaycastChange_device<TVoxel, ITMVoxelBlockHash, false> << <gridSize, cudaBlockSize >> > (
+		renderState->raycastResult->GetData(MEMORYDEVICE_CUDA),
+		NULL,
+		scene->localVBA.GetVoxelBlocks(),
+		scene->index.getIndexData(),
+		imgSize,
+		invM,
+		InvertProjectionParams(projParams),
+		oneOverVoxelSize,
+		renderState->renderingRangeImage->GetData(MEMORYDEVICE_CUDA),
+		scene->sceneParams->mu,
+		change_from,
+		change_to,
+		change_voxelTypes,
+		minX, minY, minZ,
+		maxX, maxY, maxZ
+		);
+	ORcudaKernelCheck;
+}
+
+template<class TVoxel, class TIndex>
+static void RenderChange_common(const ITMScene<TVoxel, TIndex>* scene, const ORUtils::SE3Pose* pose, const ITMIntrinsics* intrinsics, const ITMRenderState* renderState,
+	ITMUChar4Image* outputImage, IITMVisualisationEngine::RenderImageType type, IITMVisualisationEngine::RenderRaycastSelection raycastType, float* change_from, float* change_to, int* change_voxelTypes,
+	int minX, int minY, int minZ, int maxX, int maxY, int maxZ)
+{
+	Vector2i imgSize = outputImage->noDims;
+	Matrix4f invM = pose->GetInvM();
+
+	Vector4f* pointsRay;
+	//if (raycastType == IITMVisualisationEngine::RENDER_FROM_OLD_RAYCAST) {
+		//pointsRay = renderState->raycastResult->GetData(MEMORYDEVICE_CUDA);
+	//}
+	//else if (raycastType == IITMVisualisationEngine::RENDER_FROM_OLD_FORWARDPROJ) {
+		//pointsRay = renderState->forwardProjection->GetData(MEMORYDEVICE_CUDA);
+	//}
+	//else {
+		GenericRaycast_Change(scene, imgSize, invM, intrinsics->projectionParamsSimple.all, renderState, false, change_from, change_to, change_voxelTypes, minX, minY, minZ, maxX, maxY, maxZ);
+		pointsRay = renderState->raycastResult->GetData(MEMORYDEVICE_CUDA);
+	//}
+
+	Vector3f lightSource = -Vector3f(invM.getColumn(2));
+	Vector4u* outRendering = outputImage->GetData(MEMORYDEVICE_CUDA);
+
+	dim3 cudaBlockSize(8, 8);
+	dim3 gridSize((int)ceil((float)imgSize.x / (float)cudaBlockSize.x), (int)ceil((float)imgSize.y / (float)cudaBlockSize.y));
+
+	renderChange_device<false> << <gridSize, cudaBlockSize >> > (outRendering, pointsRay, scene->sceneParams->voxelSize,
+				imgSize, lightSource);
+}
+
+template<class TVoxel, class TIndex>
+static void RenderImage_common(const ITMScene<TVoxel, TIndex> *scene, const ORUtils::SE3Pose *pose, const ITMIntrinsics *intrinsics, const ITMRenderState *renderState,
+	ITMUChar4Image *outputImage, IITMVisualisationEngine::RenderImageType type, IITMVisualisationEngine::RenderRaycastSelection raycastType)
+{
+	Vector2i imgSize = outputImage->noDims;
+	Matrix4f invM = pose->GetInvM();
+
+	Vector4f *pointsRay;
+	if (raycastType == IITMVisualisationEngine::RENDER_FROM_OLD_RAYCAST) {
+		pointsRay = renderState->raycastResult->GetData(MEMORYDEVICE_CUDA);
+	} else if (raycastType == IITMVisualisationEngine::RENDER_FROM_OLD_FORWARDPROJ) {
+		pointsRay = renderState->forwardProjection->GetData(MEMORYDEVICE_CUDA);
+	} else {
+		GenericRaycast(scene, imgSize, invM, intrinsics->projectionParamsSimple.all, renderState, false);
+		pointsRay = renderState->raycastResult->GetData(MEMORYDEVICE_CUDA);
+	}
+
+	Vector3f lightSource = -Vector3f(invM.getColumn(2));
+
+	Vector4u *outRendering = outputImage->GetData(MEMORYDEVICE_CUDA);
+
+	dim3 cudaBlockSize(8, 8);
+	dim3 gridSize((int)ceil((float)imgSize.x / (float)cudaBlockSize.x), (int)ceil((float)imgSize.y / (float)cudaBlockSize.y));
+
+	if ((type == IITMVisualisationEngine::RENDER_COLOUR_FROM_VOLUME)&&
+	    (!TVoxel::hasColorInformation)) type = IITMVisualisationEngine::RENDER_SHADED_GREYSCALE;
+
+	switch (type) {
+	case IITMVisualisationEngine::RENDER_COLOUR_FROM_VOLUME:
+		renderColour_device<TVoxel, TIndex> <<<gridSize, cudaBlockSize>>>(outRendering, pointsRay, scene->localVBA.GetVoxelBlocks(),
+			scene->index.getIndexData(), imgSize);
+		ORcudaKernelCheck;
+		break;
+	case IITMVisualisationEngine::RENDER_COLOUR_FROM_NORMAL:
+		renderColourFromNormal_device<TVoxel, TIndex> <<<gridSize, cudaBlockSize>>>(outRendering, pointsRay, scene->localVBA.GetVoxelBlocks(),
+			scene->index.getIndexData(), imgSize, lightSource);
+		ORcudaKernelCheck;
+		break;
+	case IITMVisualisationEngine::RENDER_COLOUR_FROM_CONFIDENCE:
+		renderColourFromConfidence_device<TVoxel, TIndex> <<<gridSize, cudaBlockSize>>>(outRendering, pointsRay, scene->localVBA.GetVoxelBlocks(),
+			scene->index.getIndexData(), imgSize, lightSource);
+		ORcudaKernelCheck;
+		break;
+	case IITMVisualisationEngine::RENDER_SHADED_GREYSCALE_IMAGENORMALS:
+		if (intrinsics->FocalLengthSignsDiffer())
+		{
+			renderGrey_ImageNormals_device<true> <<<gridSize, cudaBlockSize>>>(outRendering, pointsRay, scene->sceneParams->voxelSize,
+				imgSize, lightSource);
+		}
+		else
+		{
+			renderGrey_ImageNormals_device<false> <<<gridSize, cudaBlockSize>>>(outRendering, pointsRay, scene->sceneParams->voxelSize,
+				imgSize, lightSource);
+		}
+		ORcudaKernelCheck;
+		break;
+	case IITMVisualisationEngine::RENDER_SHADED_GREYSCALE:
+	default:
+		renderGrey_device<TVoxel, TIndex> <<<gridSize, cudaBlockSize>>>(outRendering, pointsRay, scene->localVBA.GetVoxelBlocks(),
+			scene->index.getIndexData(), imgSize, lightSource);
+		ORcudaKernelCheck;
+		break;
+	}
+}
+
+template<class TVoxel, class TIndex>
+static void CreatePointCloud_common(const ITMScene<TVoxel, TIndex> *scene, const ITMView *view, ITMTrackingState *trackingState, ITMRenderState *renderState,
+	bool skipPoints, uint *noTotalPoints_device)
+{
+	Vector2i imgSize = renderState->raycastResult->noDims;
+	Matrix4f invM = trackingState->pose_d->GetInvM() * view->calib.trafo_rgb_to_depth.calib;
+
+	GenericRaycast(scene, imgSize, invM, view->calib.intrinsics_rgb.projectionParamsSimple.all, renderState, true);
+	trackingState->pose_pointCloud->SetFrom(trackingState->pose_d);
+
+	ORcudaSafeCall(cudaMemsetAsync(noTotalPoints_device, 0, sizeof(uint)));
+
+	Vector3f lightSource = -Vector3f(invM.getColumn(2));
+	Vector4f *locations = trackingState->pointCloud->locations->GetData(MEMORYDEVICE_CUDA);
+	Vector4f *colours = trackingState->pointCloud->colours->GetData(MEMORYDEVICE_CUDA);
+	Vector4f *pointsRay = renderState->raycastResult->GetData(MEMORYDEVICE_CUDA);
+
+	dim3 cudaBlockSize(16, 16);
+	dim3 gridSize = getGridSize(imgSize, cudaBlockSize);
+	renderPointCloud_device<TVoxel, TIndex> << <gridSize, cudaBlockSize >> >(locations, colours, noTotalPoints_device,
+		pointsRay, scene->localVBA.GetVoxelBlocks(), scene->index.getIndexData(), skipPoints, scene->sceneParams->voxelSize, imgSize, lightSource);
+	ORcudaKernelCheck;
+
+	ORcudaSafeCall(cudaMemcpy(&trackingState->pointCloud->noTotalPoints, noTotalPoints_device, sizeof(uint), cudaMemcpyDeviceToHost));
+}
+
+template<class TVoxel, class TIndex>
+void CreateICPMaps_common(const ITMScene<TVoxel, TIndex> *scene, const ITMView *view, ITMTrackingState *trackingState, ITMRenderState *renderState)
+{
+	Vector2i imgSize = renderState->raycastResult->noDims;
+	Matrix4f invM = trackingState->pose_d->GetInvM();
+
+	GenericRaycast(scene, imgSize, invM, view->calib.intrinsics_d.projectionParamsSimple.all, renderState, true);
+	trackingState->pose_pointCloud->SetFrom(trackingState->pose_d);
+
+	Vector4f *pointsMap = trackingState->pointCloud->locations->GetData(MEMORYDEVICE_CUDA);
+	Vector4f *normalsMap = trackingState->pointCloud->colours->GetData(MEMORYDEVICE_CUDA);
+	Vector4f *pointsRay = renderState->raycastResult->GetData(MEMORYDEVICE_CUDA);
+	Vector3f lightSource = -Vector3f(invM.getColumn(2));
+
+	dim3 cudaBlockSize(16, 12);
+	dim3 gridSize((int)ceil((float)imgSize.x / (float)cudaBlockSize.x), (int)ceil((float)imgSize.y / (float)cudaBlockSize.y));
+
+	if (view->calib.intrinsics_d.FocalLengthSignsDiffer())
+	{
+		renderICP_device<true> <<<gridSize, cudaBlockSize>>>(pointsMap, normalsMap, pointsRay,
+			scene->sceneParams->voxelSize, imgSize, lightSource);
+	}
+	else
+	{
+		renderICP_device<false> <<<gridSize, cudaBlockSize>>>(pointsMap, normalsMap, pointsRay,
+			scene->sceneParams->voxelSize, imgSize, lightSource);
+	}
+	ORcudaKernelCheck;
+}
+
+template<class TVoxel, class TIndex>
+static void ForwardRender_common(const ITMScene<TVoxel, TIndex> *scene, const ITMView *view, ITMTrackingState *trackingState, ITMRenderState *renderState, 
+	uint *noTotalPoints_device)
+{
+	Vector2i imgSize = renderState->raycastResult->noDims;
+	Matrix4f M = trackingState->pose_d->GetM();
+	Matrix4f invM = trackingState->pose_d->GetInvM();
+	const Vector4f& projParams = view->calib.intrinsics_d.projectionParamsSimple.all;
+
+	const Vector4f *pointsRay = renderState->raycastResult->GetData(MEMORYDEVICE_CUDA);
+	float *currentDepth = view->depth->GetData(MEMORYDEVICE_CUDA);
+	Vector4f *forwardProjection = renderState->forwardProjection->GetData(MEMORYDEVICE_CUDA);
+	int *fwdProjMissingPoints = renderState->fwdProjMissingPoints->GetData(MEMORYDEVICE_CUDA);
+	const Vector2f *minmaximg = renderState->renderingRangeImage->GetData(MEMORYDEVICE_CUDA);
+	float oneOverVoxelSize = 1.0f / scene->sceneParams->voxelSize;
+	float voxelSize = scene->sceneParams->voxelSize;
+	const TVoxel *voxelData = scene->localVBA.GetVoxelBlocks();
+	const typename TIndex::IndexData *voxelIndex = scene->index.getIndexData();
+
+	renderState->forwardProjection->Clear();
+
+	dim3 blockSize, gridSize;
+
+	{ // forward projection
+		blockSize = dim3(16, 16);
+		gridSize = dim3((int)ceil((float)imgSize.x / (float)blockSize.x), (int)ceil((float)imgSize.y / (float)blockSize.y));
+
+		forwardProject_device << <gridSize, blockSize >> >(forwardProjection, pointsRay, imgSize, M, projParams, voxelSize);
+		ORcudaKernelCheck;
+	}
+
+	ORcudaSafeCall(cudaMemset(noTotalPoints_device, 0, sizeof(uint)));
+
+	{ // find missing points
+		blockSize = dim3(16, 16);
+		gridSize = dim3((int)ceil((float)imgSize.x / (float)blockSize.x), (int)ceil((float)imgSize.y / (float)blockSize.y));
+
+		findMissingPoints_device << <gridSize, blockSize >> >(fwdProjMissingPoints, noTotalPoints_device, minmaximg, 
+			forwardProjection, currentDepth, imgSize);
+		ORcudaKernelCheck;
+	}
+
+	ORcudaSafeCall(cudaMemcpy(&renderState->noFwdProjMissingPoints, noTotalPoints_device, sizeof(uint), cudaMemcpyDeviceToHost));
+
+	{ // render missing points
+		blockSize = dim3(256);
+		gridSize = dim3((int)ceil((float)renderState->noFwdProjMissingPoints / blockSize.x));
+
+		genericRaycastMissingPoints_device<TVoxel, TIndex, false> << <gridSize, blockSize >> >(forwardProjection, NULL, voxelData, voxelIndex, imgSize, invM,
+			InvertProjectionParams(projParams), oneOverVoxelSize, fwdProjMissingPoints, renderState->noFwdProjMissingPoints, minmaximg, scene->sceneParams->mu);
+		ORcudaKernelCheck;
+	}
+}
+
+template<class TVoxel, class TIndex>
+void ITMVisualisationEngine_CUDA<TVoxel, TIndex>::RenderImage(const ITMScene<TVoxel,TIndex> *scene, const ORUtils::SE3Pose *pose, const ITMIntrinsics *intrinsics, const ITMRenderState *renderState,
+	ITMUChar4Image *outputImage, IITMVisualisationEngine::RenderImageType type,
+	IITMVisualisationEngine::RenderRaycastSelection raycastType) const
+{
+	RenderImage_common(scene, pose, intrinsics, renderState, outputImage, type, raycastType);
+}
+
+template<class TVoxel>
+void ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::RenderImage(const ITMScene<TVoxel,ITMVoxelBlockHash> *scene, const ORUtils::SE3Pose *pose, const ITMIntrinsics *intrinsics,
+	const ITMRenderState *renderState, ITMUChar4Image *outputImage, IITMVisualisationEngine::RenderImageType type,
+	IITMVisualisationEngine::RenderRaycastSelection raycastType) const
+{
+	RenderImage_common(scene, pose, intrinsics, renderState, outputImage, type, raycastType);
+}
+
+template<class TVoxel>
+void ITMLib::ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::RenderChanges(const ITMScene<TVoxel, ITMVoxelBlockHash>* scene, const ORUtils::SE3Pose* pose, const ITMIntrinsics* intrinsics, const ITMRenderState* renderState, ITMUChar4Image* outputImage, float* change_from, float* change_to, int* change_voxelTypes, int minX, int minY, int minZ, int maxX, int maxY, int maxZ, RenderImageType type, RenderRaycastSelection raycastType) const
+{
+	RenderChange_common(scene, pose, intrinsics, renderState, outputImage, type, raycastType,
+		change_from, change_to, change_voxelTypes, minX, minY, minZ, maxX, maxY, maxZ);
+
+	//void RenderChange_common(const ITMScene<TVoxel, ITMVoxelBlockHash>*scene, const ORUtils::SE3Pose * pose, const ITMIntrinsics * intrinsics, const ITMRenderState * renderState,
+		//ITMUChar4Image * outputImage, IITMVisualisationEngine::RenderImageType type, IITMVisualisationEngine::RenderRaycastSelection raycastType, float* change_from, float* change_to, int* change_voxelTypes,
+		//int minX, int minY, int minZ, int maxX, int maxY, int maxZ)
+}
+
+template<class TVoxel, class TIndex>
+void ITMVisualisationEngine_CUDA<TVoxel, TIndex>::FindSurface(const ITMScene<TVoxel,TIndex> *scene, const ORUtils::SE3Pose *pose, const ITMIntrinsics *intrinsics, const ITMRenderState *renderState) const
+{
+	GenericRaycast(scene, renderState->raycastResult->noDims, pose->GetInvM(), intrinsics->projectionParamsSimple.all, renderState, false);
+}
+
+template<class TVoxel>
+void ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::FindSurface(const ITMScene<TVoxel,ITMVoxelBlockHash> *scene, const ORUtils::SE3Pose *pose, const ITMIntrinsics *intrinsics,
+	const ITMRenderState *renderState) const
+{
+	GenericRaycast(scene, renderState->raycastResult->noDims, pose->GetInvM(), intrinsics->projectionParamsSimple.all, renderState, false);
+}
+
+template<class TVoxel, class TIndex>
+void ITMVisualisationEngine_CUDA<TVoxel, TIndex>::CreatePointCloud(const ITMScene<TVoxel,TIndex> *scene, const ITMView *view, ITMTrackingState *trackingState, ITMRenderState *renderState, 
+	bool skipPoints) const
+{
+	CreatePointCloud_common(scene, view, trackingState, renderState, skipPoints, noTotalPoints_device);
+}
+
+template<class TVoxel>
+void ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::CreatePointCloud(const ITMScene<TVoxel,ITMVoxelBlockHash> *scene,const ITMView *view, ITMTrackingState *trackingState, 
+	ITMRenderState *renderState, bool skipPoints) const
+{
+	CreatePointCloud_common(scene, view, trackingState, renderState, skipPoints, noTotalPoints_device);
+}
+
+template<class TVoxel, class TIndex>
+void ITMVisualisationEngine_CUDA<TVoxel, TIndex>::CreateICPMaps(const ITMScene<TVoxel,TIndex> *scene, const ITMView *view, ITMTrackingState *trackingState, 
+	ITMRenderState *renderState) const
+{
+	CreateICPMaps_common(scene, view, trackingState, renderState);
+}
+
+template<class TVoxel>
+void ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::CreateICPMaps(const ITMScene<TVoxel,ITMVoxelBlockHash> *scene, const ITMView *view, ITMTrackingState *trackingState, 
+	ITMRenderState *renderState) const
+{
+	CreateICPMaps_common(scene, view, trackingState, renderState);
+}
+
+template<class TVoxel, class TIndex>
+void ITMVisualisationEngine_CUDA<TVoxel, TIndex>::ForwardRender(const ITMScene<TVoxel,TIndex> *scene, const ITMView *view, ITMTrackingState *trackingState, 
+	ITMRenderState *renderState) const
+{
+	ForwardRender_common(scene, view, trackingState, renderState, this->noTotalPoints_device);
+}
+
+template<class TVoxel>
+void ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::ForwardRender(const ITMScene<TVoxel,ITMVoxelBlockHash> *scene, const ITMView *view, ITMTrackingState *trackingState, 
+	ITMRenderState *renderState) const
+{
+	ForwardRender_common(scene, view, trackingState, renderState, this->noTotalPoints_device);
+}
+
+__global__ void cuda_findMinMaxPos(int* firstEntry, float* minX_device, float* minY_device, float* minZ_device, float* maxX_device, float* maxY_device, float* maxZ_device, const ITMHashEntry* hashTable, int noTotalEntries)
+{
+	int entryId = threadIdx.x + blockIdx.x * blockDim.x;
+	if (entryId > noTotalEntries - 1) return;
+
+	const ITMHashEntry& currentHashEntry = hashTable[entryId];
+
+	if (currentHashEntry.ptr >= 0) {
+		Vector3i globalPos = currentHashEntry.pos.toInt() * SDF_BLOCK_SIZE;
+
+		if (atomicAdd(firstEntry, 1) == 0) {
+			*minX_device = globalPos.x;
+			*minY_device = globalPos.y;
+			*minZ_device = globalPos.z;
+
+			*maxX_device = globalPos.x;
+			*maxY_device = globalPos.y;
+			*maxZ_device = globalPos.z;
+		}
+		else {
+			atomicMin(minX_device, globalPos.x);
+			atomicMin(minY_device, globalPos.y);
+			atomicMin(minZ_device, globalPos.z);
+
+			atomicMax(maxX_device, globalPos.x);
+			atomicMax(maxY_device, globalPos.y);
+			atomicMax(maxZ_device, globalPos.z);
+		}
+	}
+}
+
+// Cuda Array Initializers
+__global__ void initFloatArray(float* array, const float value, const int size) {
+	int i = threadIdx.x + blockIdx.x * blockDim.x;
+
+	if (i < size) {
+		array[i] = value;
+	}
+}
+
+__global__ void initIntArray(int* array, const int value, const int size) {
+	int i = threadIdx.x + blockIdx.x * blockDim.x;
+
+	if (i < size) {
+		array[i] = value;
+	}
+}
+
+template<class TVoxel>
+__global__ void cuda_updateDepthInterval(
+	float* from, 
+	float* to, 
+	int* voxelTypes, 
+	int minX, int minY, int minZ, 
+	int maxX, int maxY, int maxZ, 
+	int sizeX, int sizeY, 
+	const TVoxel* localVBA, 
+	const ITMHashEntry* hashTable) 
+{
+	// update Depth Intervals along one Voxeltower
+	int x = threadIdx.x + blockIdx.x * blockDim.x;
+	int y = threadIdx.y + blockIdx.y * blockDim.y;
+
+	if (x < sizeX && y < sizeY) {
+
+		/*if (x == 10 && y == 10) {
+			for (int i = 0; i < cuda_nrDepthIntervals; i++) {
+				float from_val = to[x + (sizeX * y) + (sizeX * sizeY * i)];
+				printf("from value: %f\n", from_val);
+			}
+		}*/
+
+		int depthIndex = 0;
+		bool isSurface = false, lastBlocksWereSurface = false;
+
+		// travels along voxel tower from minZ to maxZ and update depth intervals
+		for (int z = minZ; z <= maxZ; z++) {
+			// decide whether voxel contains surface or not
+			Vector3i position(minX + x, minY + y, z);
+			Vector3f points[8]; float sdfVals[8];
+
+			if (!findPointNeighbors(points, sdfVals, position, localVBA, hashTable)) isSurface = false;
+
+			int cubeIndex = 0;
+			if (sdfVals[0] < 0) cubeIndex |= 1; if (sdfVals[1] < 0) cubeIndex |= 2;
+			if (sdfVals[2] < 0) cubeIndex |= 4; if (sdfVals[3] < 0) cubeIndex |= 8;
+			if (sdfVals[4] < 0) cubeIndex |= 16; if (sdfVals[5] < 0) cubeIndex |= 32;
+			if (sdfVals[6] < 0) cubeIndex |= 64; if (sdfVals[7] < 0) cubeIndex |= 128;
+
+			if (cubeIndex == 0) isSurface = false;
+			else isSurface = true;
+
+			// update depth intervals
+			if (z == minZ) {
+				from[x + (sizeX * y) + (sizeX * sizeY * depthIndex)] = z;
+				to[x + (sizeX * y) + (sizeX * sizeY * depthIndex)] = z;
+				voxelTypes[x + (sizeX * y) + (sizeX * sizeY * depthIndex)] = isSurface ? CUDA_SURFACE : CUDA_UNSEEN;
+				lastBlocksWereSurface = isSurface;
+			}
+			else {
+				if (isSurface != lastBlocksWereSurface) {
+					if (depthIndex < cuda_nrDepthIntervals - 1) {
+						depthIndex++;
+						from[x + (sizeX * y) + (sizeX * sizeY * depthIndex)] = z - 1;
+						to[x + (sizeX * y) + (sizeX * sizeY * depthIndex)] = z;
+						voxelTypes[x + (sizeX * y) + (sizeX * sizeY * depthIndex)] = isSurface ? CUDA_SURFACE : CUDA_UNSEEN;
+						lastBlocksWereSurface = isSurface;
+					}
+				}
+				else {
+					to[x + (sizeX * y) + (sizeX * sizeY * depthIndex)] = z;
+				}
+			}
+		}
+	}
+}
+
+__global__ void debugArray(float* from, float* to, int* voxelTypes, int sizeX, int sizeY, int line) {
+	int x = 200;
+	int y = 100;
+
+	if (x >= 0 && y >= 0 && x < sizeX && y < sizeY) {
+		printf("Line %d: \n", line);
+		for (int i = 0; i < cuda_nrDepthIntervals; i++) {
+			printf("(%f, %f, %d) ",
+				from[x + (sizeX * y) + (sizeX * sizeY * i)],
+				to[x + (sizeX * y) + (sizeX * sizeY * i)],
+				voxelTypes[x + (sizeX * y) + (sizeX * sizeY * i)]
+			);
+		}
+	}
+
+	printf("\n\n");
+}
+
+__global__ void cuda_detectChangesInterval(
+	float* change_from, float* change_to, int* change_voxelTypes,
+	float* active_from, float* active_to, int* active_voxelTypes,
+	float* old_from, float* old_to, int* old_voxelTypes,
+	int active_sizeX, int active_sizeY, int old_sizeX, int old_sizeY, int sizeX, int sizeY,
+	int active_minX, int active_minY, int active_minZ,
+	int active_maxX, int active_maxY, int active_maxZ,
+	int old_minX, int old_minY, int old_minZ,
+	int old_maxX, int old_maxY, int old_maxZ,
+	int offsetX, int offsetY)
+{
+	int x = threadIdx.x + blockIdx.x * blockDim.x;
+	int y = threadIdx.y + blockIdx.y * blockDim.y;
+
+	if (x < sizeX && y < sizeY) {
+		int globalpos_x = active_minX + x;
+		int globalpos_y = active_minY + y;
+
+		// check if the voxeltower of the active scene is outside of the old scene
+		if (globalpos_x < old_minX || globalpos_x > old_maxX ||
+			globalpos_y < old_minY || globalpos_y > old_maxY)
+		{
+			// copy depth intervals of active scene into change scene
+			for (int i = 0; i < cuda_nrDepthIntervals; i++) {
+				change_from[x + (sizeX * y) + (sizeX * sizeY * i)] = active_from[x + (sizeX * y) + (sizeX * sizeY * i)];
+				change_to[x + (sizeX * y) + (sizeX * sizeY * i)] = active_to[x + (sizeX * y) + (sizeX * sizeY * i)];
+				change_voxelTypes[x + (sizeX * y) + (sizeX * sizeY * i)] = active_voxelTypes[x + (sizeX * y) + (sizeX * sizeY * i)];
+			}
+		}
+		else
+		{
+			int active_x = x;
+			int active_y = y;
+			int old_x = active_minX < old_minX ? x - offsetX : x + offsetX;
+			int old_y = active_minY < old_minY ? y - offsetY : y + offsetY;
+
+			int active_globalpos_x = active_minX + active_x;
+			int active_globalpos_y = active_minY + active_y;
+			int old_globalpos_x = old_minX + old_x;
+			int old_globalpos_y = old_minY + old_y;
+
+			if (active_globalpos_x >= active_minX && active_globalpos_x <= active_maxX &&
+				active_globalpos_y >= active_minY && active_globalpos_y <= active_maxY &&
+				old_globalpos_x >= active_minX && old_globalpos_x <= active_maxX &&
+				old_globalpos_y >= active_minY && old_globalpos_y <= active_maxY) {
+
+				// compare depth intervals of active scene and old scene
+				int index_change = 0;
+				int index_active = 0;
+				int index_old = 0;
+
+				while (index_old < cuda_nrDepthIntervals && index_active < cuda_nrDepthIntervals && index_change < cuda_nrDepthIntervals) {
+					float currentMin_old = old_from[old_x + (old_sizeX * old_y) + (old_sizeX * old_sizeY * index_old)];
+					float currentMax_old = old_to[old_x + (old_sizeX * old_y) + (old_sizeX * old_sizeY * index_old)];
+					float currentMin_active = active_from[active_x + (active_sizeX * active_y) + (active_sizeX * active_sizeY * index_active)];
+					float currentMax_active = active_to[active_x + (active_sizeX * active_y) + (active_sizeX * active_sizeY * index_active)];
+
+					float min = currentMin_old > currentMin_active ? currentMin_old : currentMin_active;
+					float max = currentMax_old < currentMax_active ? currentMax_old : currentMax_active;
+
+					// if interval is not valid (it is initialized with invalid values, but its not used)
+					if (currentMin_active < active_minZ || currentMax_active > active_maxZ || currentMin_old < old_minZ || currentMax_old > old_maxZ) {
+						// also init change intervals with invalid values
+						if (currentMin_active >= active_minZ && currentMax_active <= active_maxZ) {
+							change_from[x + (sizeX * y) + (sizeX * sizeY * index_change)] = active_from[active_x + (sizeX * active_y) + (sizeX * sizeY * index_active)];
+							change_to[x + (sizeX * y) + (sizeX * sizeY * index_change)] = active_to[active_x + (sizeX * active_y) + (sizeX * sizeY * index_active)];
+							change_voxelTypes[x + (sizeX * y) + (sizeX * sizeY * index_change)] = active_voxelTypes[active_x + (sizeX * active_y) + (sizeX * sizeY * index_active)];
+						}
+						else {
+							change_from[x + (sizeX * y) + (sizeX * sizeY * index_change)] = active_minZ - 1.0f;
+							change_to[x + (sizeX * y) + (sizeX * sizeY * index_change)] = active_maxZ + 1.0f;
+							change_voxelTypes[x + (sizeX * y) + (sizeX * sizeY * index_change)] = CUDA_UNDEFINED;
+						}
+						index_active++;
+						index_change++;
+						continue;
+					}
+
+					// case: intervals of active scene are before intervals of old scene
+					if (index_old == 0 && index_active == 0) {
+						while (currentMin_active < currentMin_old) {
+							if (active_voxelTypes[active_x + (sizeX * active_y) + (sizeX * sizeY * index_active)] == CUDA_UNDEFINED) {
+								change_from[x + (sizeX * y) + (sizeX * sizeY * index_change)] = currentMin_active;
+								change_to[x + (sizeX * y) + (sizeX * sizeY * index_change)] = active_maxZ;
+								change_voxelTypes[x + (sizeX * y) + (sizeX * sizeY * index_change)] = active_voxelTypes[active_x + (sizeX * active_y) + (sizeX * sizeY * index_active)];
+								return;
+							}
+							else {
+								change_from[x + (sizeX * y) + (sizeX * sizeY * index_change)] = currentMin_active;
+								change_to[x + (sizeX * y) + (sizeX * sizeY * index_change)] = currentMax_active < currentMin_old ? currentMax_active : currentMin_old;
+								change_voxelTypes[x + (sizeX * y) + (sizeX * sizeY * index_change)] = active_voxelTypes[active_x + (sizeX * active_y) + (sizeX * sizeY * index_active)];
+								index_change++;
+							}
+
+							if (currentMax_active > currentMin_old) break;
+
+							index_active++;
+							currentMin_active = active_from[active_x + (active_sizeX * active_y) + (active_sizeX * active_sizeY * index_active)];
+							currentMax_active = active_to[active_x + (active_sizeX * active_y) + (active_sizeX * active_sizeY * index_active)];
+						}
+					}
+
+					// case: intervals of old scene are before intervals of active scene
+					if (index_active == 0) {
+						if (currentMin_active > currentMax_old) {
+							index_old++;
+							continue;
+						}
+					}
+
+					currentMin_old = old_from[old_x + (old_sizeX * old_y) + (old_sizeX * old_sizeY * index_old)];
+					currentMax_old = old_to[old_x + (old_sizeX * old_y) + (old_sizeX * old_sizeY * index_old)];
+					currentMin_active = active_from[active_x + (active_sizeX * active_y) + (active_sizeX * active_sizeY * index_active)];
+					currentMax_active = active_to[active_x + (active_sizeX * active_y) + (active_sizeX * active_sizeY * index_active)];
+
+					min = currentMin_old > currentMin_active ? currentMin_old : currentMin_active;
+					max = currentMax_old < currentMax_active ? currentMax_old : currentMax_active;
+
+					change_from[x + (sizeX * y) + (sizeX * sizeY * index_change)] = min;
+					change_to[x + (sizeX * y) + (sizeX * sizeY * index_change)] = max;
+
+					if (active_voxelTypes[active_x + (active_sizeX * active_y) + (active_sizeX * active_sizeY * index_active)] != old_voxelTypes[old_x + (old_sizeX * old_y) + (old_sizeX * old_sizeY * index_old)]) {
+						change_from[x + (sizeX * y) + (sizeX * sizeY * index_change)] = min;
+						change_to[x + (sizeX * y) + (sizeX * sizeY * index_change)] = max;
+						
+						change_voxelTypes[x + (sizeX * y) + (sizeX * sizeY * index_change)] = CUDA_CHANGE;
+					}
+					else {
+						change_voxelTypes[x + (sizeX * y) + (sizeX * sizeY * index_change)] = active_voxelTypes[active_x + (active_sizeX * active_y) + (active_sizeX * active_sizeY * index_active)];
+					}
+
+					index_change++;
+
+					if (currentMax_active < currentMax_old) {
+						index_active++;
+					}
+					else if (currentMax_active > currentMax_old) {
+						index_old++;
+					}
+					else {
+						index_active++;
+						index_old++;
+					}
+				}
+			}
+		}
+
+
+	}
+}
+
+template<class TVoxel>
+void ITMLib::ITMVisualisationEngine_CUDA<TVoxel, ITMVoxelBlockHash>::updateDepthIntervals(ITMScene<TVoxel, ITMVoxelBlockHash>* activeScene, ITMScene<TVoxel, ITMVoxelBlockHash>* oldScene, const ORUtils::SE3Pose* pose, const ITMIntrinsics* intrinsics,
+	const ITMRenderState* renderState, ITMUChar4Image* outputImage, RenderImageType type, RenderRaycastSelection raycastType)
+{
+	//------- View Frustum ------------------------------------------------------------------
+	
+		ViewFrustum viewFrustum;
+		float near_plane_dist = 10.0f;
+		float far_plane_dist = 1000.0f;
+		Matrix4f viewMatrix = pose->GetM();
+		Matrix4f viewInverse = pose->GetInvM();
+		Matrix4f viewTranspose = viewInverse.t();
+
+		Vector4f projParams_d = intrinsics->projectionParamsSimple.all;
+		Vector4f invProjParams_d = projParams_d;
+		invProjParams_d.x = 1.0f / invProjParams_d.x;
+		invProjParams_d.y = 1.0f / invProjParams_d.y;
+
+		// Coordinates in image space
+		Vector2f top_left_corner_img = Vector2f(0.0f, 0.0f);
+		Vector2f top_right_corner_img = Vector2f(640.0f, 0.0f);
+		Vector2f bottom_left_corner_img = Vector2f(0.0f, 480.0f);
+		Vector2f bottom_right_corner_img = Vector2f(640.0f, 480.0f);
+
+		// Coordinates of view frustum in camera space
+		Vector3f near_plane_top_left_corner_camera = Vector3f(0.0f, 0.0f, near_plane_dist);
+		Vector3f near_plane_top_right_corner_camera = Vector3f(0.0f, 0.0f, near_plane_dist);
+		Vector3f near_plane_bottom_left_corner_camera = Vector3f(0.0f, 0.0f, near_plane_dist);
+		Vector3f near_plane_bottom_right_corner_camera = Vector3f(0.0f, 0.0f, near_plane_dist);
+
+		Vector3f far_plane_top_left_corner_camera = Vector3f(0.0f, 0.0f, far_plane_dist);
+		Vector3f far_plane_top_right_corner_camera = Vector3f(0.0f, 0.0f, far_plane_dist);
+		Vector3f far_plane_bottom_left_corner_camera = Vector3f(0.0f, 0.0f, far_plane_dist);
+		Vector3f far_plane_bottom_right_corner_camera = Vector3f(0.0f, 0.0f, far_plane_dist);
+
+		near_plane_top_left_corner_camera.x = (top_left_corner_img.x - invProjParams_d.z) * near_plane_dist * invProjParams_d.x;
+		near_plane_top_left_corner_camera.y = (top_left_corner_img.y - invProjParams_d.w) * near_plane_dist * invProjParams_d.y;
+		near_plane_top_right_corner_camera.x = (top_right_corner_img.x - invProjParams_d.z) * near_plane_dist * invProjParams_d.x;
+		near_plane_top_right_corner_camera.y = (top_right_corner_img.y - invProjParams_d.w) * near_plane_dist * invProjParams_d.y;
+		near_plane_bottom_left_corner_camera.x = (bottom_left_corner_img.x - invProjParams_d.z) * near_plane_dist * invProjParams_d.x;
+		near_plane_bottom_left_corner_camera.y = (bottom_left_corner_img.y - invProjParams_d.w) * near_plane_dist * invProjParams_d.y;
+		near_plane_bottom_right_corner_camera.x = (bottom_right_corner_img.x - invProjParams_d.z) * near_plane_dist * invProjParams_d.x;
+		near_plane_bottom_right_corner_camera.y = (bottom_right_corner_img.y - invProjParams_d.w) * near_plane_dist * invProjParams_d.y;
+
+		far_plane_top_left_corner_camera.x = (top_left_corner_img.x - invProjParams_d.z) * far_plane_dist * invProjParams_d.x;
+		far_plane_top_left_corner_camera.y = (top_left_corner_img.y - invProjParams_d.w) * far_plane_dist * invProjParams_d.y;
+		far_plane_top_right_corner_camera.x = (top_right_corner_img.x - invProjParams_d.z) * far_plane_dist * invProjParams_d.x;
+		far_plane_top_right_corner_camera.y = (top_right_corner_img.y - invProjParams_d.w) * far_plane_dist * invProjParams_d.y;
+		far_plane_bottom_left_corner_camera.x = (bottom_left_corner_img.x - invProjParams_d.z) * far_plane_dist * invProjParams_d.x;
+		far_plane_bottom_left_corner_camera.y = (bottom_left_corner_img.y - invProjParams_d.w) * far_plane_dist * invProjParams_d.y;
+		far_plane_bottom_right_corner_camera.x = (bottom_right_corner_img.x - invProjParams_d.z) * far_plane_dist * invProjParams_d.x;
+		far_plane_bottom_right_corner_camera.y = (bottom_right_corner_img.y - invProjParams_d.w) * far_plane_dist * invProjParams_d.y;
+
+		//Coordinates of view frustum in world space
+		Vector3f near_plane_top_left_corner_world = viewInverse * near_plane_top_left_corner_camera;
+		Vector3f near_plane_top_right_corner_world = viewInverse * near_plane_top_right_corner_camera;
+		Vector3f near_plane_bottom_left_corner_world = viewInverse * near_plane_bottom_left_corner_camera;
+		Vector3f near_plane_bottom_right_corner_world = viewInverse * near_plane_bottom_right_corner_camera;
+
+		Vector3f far_plane_top_left_corner_world = viewInverse * far_plane_top_left_corner_camera;
+		Vector3f far_plane_top_right_corner_world = viewInverse * far_plane_top_right_corner_camera;
+		Vector3f far_plane_bottom_left_corner_world = viewInverse * far_plane_bottom_left_corner_camera;
+		Vector3f far_plane_bottom_right_corner_world = viewInverse * far_plane_bottom_right_corner_camera;
+
+		printf("near_plane_top_left_corner_world: %f %f %f\n", near_plane_top_left_corner_world.x, near_plane_top_left_corner_world.y, near_plane_top_left_corner_world.z);
+		printf("near_plane_top_right_corner_world: %f %f %f\n", near_plane_top_right_corner_world.x, near_plane_top_right_corner_world.y, near_plane_top_right_corner_world.z);
+		printf("near_plane_bottom_left_corner_world: %f %f %f\n", near_plane_bottom_left_corner_world.x, near_plane_bottom_left_corner_world.y, near_plane_bottom_left_corner_world.z);
+		printf("near_plane_bottom_right_corner_world: %f %f %f\n", near_plane_bottom_right_corner_world.x, near_plane_bottom_right_corner_world.y, near_plane_bottom_right_corner_world.z);
+		printf("\n");
+		printf("far_plane_top_left_corner_world: %f %f %f\n", far_plane_top_left_corner_world.x, far_plane_top_left_corner_world.y, far_plane_top_left_corner_world.z);
+		printf("far_plane_top_right_corner_world: %f %f %f\n", far_plane_top_right_corner_world.x, far_plane_top_right_corner_world.y, far_plane_top_right_corner_world.z);
+		printf("far_plane_bottom_left_corner_world: %f %f %f\n", far_plane_bottom_left_corner_world.x, far_plane_bottom_left_corner_world.y, far_plane_bottom_left_corner_world.z);
+		printf("far_plane_bottom_right_corner_world: %f %f %f\n", far_plane_bottom_right_corner_world.x, far_plane_bottom_right_corner_world.y, far_plane_bottom_right_corner_world.z);
+
+		// Near Plane
+		Plane nearPlane, farPlane, leftPlane, rightPlane, bottomPlane, topPlane;
+		nearPlane.u = near_plane_top_right_corner_world - near_plane_top_left_corner_world;
+		nearPlane.v = near_plane_bottom_left_corner_world - near_plane_top_left_corner_world;
+		nearPlane.u = nearPlane.u;
+		nearPlane.v = nearPlane.v;
+		nearPlane.normal = cross(nearPlane.u, nearPlane.v);
+		nearPlane.normal = nearPlane.normal.normalised();
+		nearPlane.point = near_plane_top_left_corner_world;
+		nearPlane.A = nearPlane.normal.x;
+		nearPlane.B = nearPlane.normal.y;
+		nearPlane.C = nearPlane.normal.z;
+		nearPlane.D = nearPlane.normal.x * nearPlane.point.x + nearPlane.normal.y * nearPlane.point.y + nearPlane.normal.z * nearPlane.point.z;
+
+		farPlane.u = far_plane_top_right_corner_world - far_plane_top_left_corner_world;
+		farPlane.v = far_plane_bottom_left_corner_world - far_plane_top_left_corner_world;
+		farPlane.u = farPlane.u;
+		farPlane.v = farPlane.v;
+		farPlane.normal = cross(farPlane.u, farPlane.v);
+		farPlane.normal = farPlane.normal.normalised();
+		farPlane.point = far_plane_top_left_corner_world;
+		farPlane.A = farPlane.normal.x;
+		farPlane.B = farPlane.normal.y;
+		farPlane.C = farPlane.normal.z;
+		farPlane.D = farPlane.normal.x * farPlane.point.x + farPlane.normal.y * farPlane.point.y + farPlane.normal.z * farPlane.point.z;
+
+		leftPlane.u = far_plane_top_left_corner_world - near_plane_top_left_corner_world;
+		leftPlane.v = near_plane_bottom_left_corner_world - near_plane_top_left_corner_world;
+		leftPlane.u = leftPlane.u;
+		leftPlane.v = leftPlane.v;
+		leftPlane.normal = cross(leftPlane.u, leftPlane.v);
+		leftPlane.normal = leftPlane.normal.normalised();
+		leftPlane.point = near_plane_top_left_corner_world;
+		leftPlane.A = leftPlane.normal.x;
+		leftPlane.B = leftPlane.normal.y;
+		leftPlane.C = leftPlane.normal.z;
+		leftPlane.D = leftPlane.normal.x * leftPlane.point.x + leftPlane.normal.y * leftPlane.point.y + leftPlane.normal.z * leftPlane.point.z;
+
+		rightPlane.u = far_plane_top_right_corner_world - near_plane_top_right_corner_world;
+		rightPlane.v = near_plane_bottom_right_corner_world - near_plane_top_right_corner_world;
+		rightPlane.u = rightPlane.u;
+		rightPlane.v = rightPlane.v;
+		rightPlane.normal = cross(rightPlane.u, rightPlane.v);
+		rightPlane.normal = rightPlane.normal.normalised();
+		rightPlane.point = near_plane_top_right_corner_world;
+		rightPlane.A = rightPlane.normal.x;
+		rightPlane.B = rightPlane.normal.y;
+		rightPlane.C = rightPlane.normal.z;
+		rightPlane.D = rightPlane.normal.x * rightPlane.point.x + rightPlane.normal.y * rightPlane.point.y + rightPlane.normal.z * rightPlane.point.z;
+
+		topPlane.u = far_plane_top_left_corner_world - near_plane_top_left_corner_world;
+		topPlane.v = near_plane_top_right_corner_world - near_plane_top_left_corner_world;
+		topPlane.u = topPlane.u;
+		topPlane.v = topPlane.v;
+		topPlane.normal = cross(topPlane.u, topPlane.v);
+		topPlane.normal = topPlane.normal.normalised();
+		topPlane.point = near_plane_top_left_corner_world;
+		topPlane.A = topPlane.normal.x;
+		topPlane.B = topPlane.normal.y;
+		topPlane.C = topPlane.normal.z;
+		topPlane.D = topPlane.normal.x * topPlane.point.x + topPlane.normal.y * topPlane.point.y + topPlane.normal.z * topPlane.point.z;
+
+		bottomPlane.u = far_plane_bottom_left_corner_world - near_plane_bottom_left_corner_world;
+		bottomPlane.v = near_plane_bottom_right_corner_world - near_plane_bottom_left_corner_world;
+		bottomPlane.u = bottomPlane.u;
+		bottomPlane.v = bottomPlane.v;
+		bottomPlane.normal = cross(bottomPlane.u, bottomPlane.v);
+		bottomPlane.normal = bottomPlane.normal.normalised();
+		bottomPlane.point = near_plane_bottom_left_corner_world;
+		bottomPlane.A = bottomPlane.normal.x;
+		bottomPlane.B = bottomPlane.normal.y;
+		bottomPlane.C = bottomPlane.normal.z;
+		bottomPlane.D = bottomPlane.normal.x * bottomPlane.point.x + bottomPlane.normal.y * bottomPlane.point.y + bottomPlane.normal.z * bottomPlane.point.z;
+
+
+		printf("Near Plane A: %f, B: %f, C: %f, D: %f\n", nearPlane.A, nearPlane.B, nearPlane.C, nearPlane.D);
+		printf("Far Plane A: %f, B: %f, C: %f, D: %f\n", farPlane.A, farPlane.B, farPlane.C, farPlane.D);
+		printf("Left Plane A: %f, B: %f, C: %f, D: %f\n", leftPlane.A, leftPlane.B, leftPlane.C, leftPlane.D);
+		printf("Right Plane A: %f, B: %f, C: %f, D: %f\n", rightPlane.A, rightPlane.B, rightPlane.C, rightPlane.D);
+		printf("Top Plane A: %f, B: %f, C: %f, D: %f\n", topPlane.A, topPlane.B, topPlane.C, topPlane.D);
+		printf("Bottom Plane A: %f, B: %f, C: %f, D: %f\n", bottomPlane.A, bottomPlane.B, bottomPlane.C, bottomPlane.D);
+	
+	//----------------------------------------------------------------------------------------
+
+	//------- Voxel Blocks Information ------------------------------------------------------------------
+	const TVoxel* localVBA = activeScene->localVBA.GetVoxelBlocks();
+	const ITMHashEntry* hashTable = activeScene->index.GetEntries();
+	int noTotalEntries = activeScene->index.noTotalEntries;
+	//---------------------------------------------------------------------------------------------------
+
+	//------- Find borders of active Scene --------------------------------------------------------------
+	float* minX_device, * minY_device, * minZ_device;
+	float* maxX_device, * maxY_device, * maxZ_device;
+	int* firstEntry;
+
+	cudaMalloc((void**)&minX_device, sizeof(float)); cudaMalloc((void**)&minY_device, sizeof(float)); cudaMalloc((void**)&minZ_device, sizeof(float));
+	cudaMalloc((void**)&maxX_device, sizeof(float)); cudaMalloc((void**)&maxY_device, sizeof(float)); cudaMalloc((void**)&maxZ_device, sizeof(float));
+	cudaMalloc((void**)&firstEntry, sizeof(int)); cudaMemset(firstEntry, 0, sizeof(int));
+
+	dim3 cudaBlockSize(256);
+	dim3 gridSize((int)ceilf((float)noTotalEntries / (float)cudaBlockSize.x));
+	cuda_findMinMaxPos << <gridSize, cudaBlockSize >> > (
+		firstEntry,
+		minX_device, minY_device, minZ_device,
+		maxX_device, maxY_device, maxZ_device,
+		hashTable, noTotalEntries
+	); cudaDeviceSynchronize();
+
+	cudaMemcpy((void**)&(activeScene->minX), minX_device, sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy((void**)&(activeScene->minY), minY_device, sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy((void**)&(activeScene->minZ), minZ_device, sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy((void**)&(activeScene->maxX), maxX_device, sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy((void**)&(activeScene->maxY), maxY_device, sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy((void**)&(activeScene->maxZ), maxZ_device, sizeof(float), cudaMemcpyDeviceToHost);
+
+	activeScene->sizeX = activeScene->maxX - activeScene->minX;
+	activeScene->sizeY = activeScene->maxY - activeScene->minY;
+
+	printf("Active Scene (%d):\n", activeScene);
+	printf("Min Pos (%f, %f, %f)\n", activeScene->minX, activeScene->minY, activeScene->minZ);
+	printf("Max Pos (%f, %f, %f)\n", activeScene->maxX, activeScene->maxY, activeScene->maxZ);
+	printf("Size: (%d, %d)\n\n", activeScene->sizeX, activeScene->sizeY);
+	printf("Old Scene (%d):\n", oldScene);
+	printf("Min Pos (%f, %f, %f)\n", oldScene->minX, oldScene->minY, oldScene->minZ);
+	printf("Max Pos (%f, %f, %f)\n", oldScene->maxX, oldScene->maxY, oldScene->maxZ);
+	printf("Size: (%d, %d)\n\n", oldScene->sizeX, oldScene->sizeY);
+	//---------------------------------------------------------------------------------------------------
+
+	// Initialize Intervals of active Scene
+	for (int x = activeScene->minX; x < activeScene->maxX; x++) {
+		for (int y = activeScene->minY; y < activeScene->maxY; y++) {
+			Line line;
+			line.point = Vector3f(x, y, activeScene->minZ);
+			line.direction = Vector3f(0, 0, 1);
+
+			Vector4f intersection = intersectPlaneLine(bottomPlane, line);
+
+			if (pointInsidePlane(Vector3f(intersection.x, intersection.y, intersection.z), bottomPlane)) {
+				printf("Intersection with VoxelTower (%d, %d) at (%f, %f, %f)\n", x, y, intersection.x, intersection.y, intersection.z);
+			}
+		}
+	}
+	
+	//------- Update Depth Intervals of active Scene ----------------------------------------------------
+	if (activeScene->sizeX > 0 && activeScene->sizeY > 0) {
+		cudaMalloc((void**)&(activeScene->from), sizeof(float) * activeScene->sizeX * activeScene->sizeY * nrDepthIntervals);
+		cudaMalloc((void**)&(activeScene->to), sizeof(float) * activeScene->sizeX * activeScene->sizeY * nrDepthIntervals);
+		cudaMalloc((void**)&(activeScene->voxelTypes), sizeof(int) * activeScene->sizeX * activeScene->sizeY * nrDepthIntervals);
+	}
+
+	if (activeScene->sizeX > 0 && activeScene->sizeY > 0) {
+		const int threadsPerBlock = 256;
+		const int arraySize = activeScene->sizeX * activeScene->sizeY * nrDepthIntervals;
+		const int blocksPerGrid = (arraySize + threadsPerBlock - 1) / threadsPerBlock;
+		initFloatArray << <blocksPerGrid, threadsPerBlock >> > (activeScene->from, activeScene->minZ - 1.0f, activeScene->sizeX * activeScene->sizeY * nrDepthIntervals); cudaDeviceSynchronize();
+		initFloatArray << <blocksPerGrid, threadsPerBlock >> > (activeScene->to, activeScene->maxZ + 1.0f, activeScene->sizeX * activeScene->sizeY * nrDepthIntervals); cudaDeviceSynchronize();
+		initIntArray << <blocksPerGrid, threadsPerBlock >> > (activeScene->voxelTypes, UNDEFINED, activeScene->sizeX * activeScene->sizeY * nrDepthIntervals); cudaDeviceSynchronize();
+	}
+	
+	if (activeScene->sizeX > 0 && activeScene->sizeY > 0) {
+		dim3 dimBlock(16, 16);
+		dim3 dimGrid(activeScene->sizeX / 16 + 1, activeScene->sizeY / 16 + 1);
+		cuda_updateDepthInterval<TVoxel> << <dimGrid, dimBlock >> > (
+			activeScene->from,
+			activeScene->to,
+			activeScene->voxelTypes,
+			activeScene->minX, activeScene->minY, activeScene->minZ,
+			activeScene->maxX, activeScene->maxY, activeScene->maxZ,
+			activeScene->sizeX, activeScene->sizeY,
+			localVBA,
+			hashTable
+		); cudaDeviceSynchronize();
+	}
+
+	//debugArray <<<1, 1>>> (activeScene->from, activeScene->to, activeScene->voxelTypes, activeScene->sizeX, activeScene->sizeY, 998);
+	//---------------------------------------------------------------------------------------------------
+
+	//------- Update Change Detection of each interval --------------------------------------------------
+	
+	// Only update if both scenes have updated depth intervals
+	if (activeScene->sizeX > 0 && activeScene->sizeY > 0 &&
+		oldScene->sizeX > 0 && oldScene->sizeY > 0)
+	{
+		//dim3 dimBlock_debug(1);
+		//dim3 dimGrid_debug(1);
+		//printf("Debugging active and old array\n");
+		//debugArray << <1, 1 >> > (activeScene->from, activeScene->to, activeScene->voxelTypes, activeScene->sizeX, activeScene->sizeY, 1011); cudaDeviceSynchronize();
+		//debugArray << <1, 1 >> > (oldScene->from, oldScene->to, oldScene->voxelTypes, oldScene->sizeX, oldScene->sizeY, 1013); cudaDeviceSynchronize();
+
+		//printf("Line 1015: Update change detection of depth intervals\n");
+		
+		this->sizeX = activeScene->sizeX;
+		this->sizeY = activeScene->sizeY;
+		cudaMalloc((void**) &(this->change_from), sizeof(float) * this->sizeX * this->sizeY * nrDepthIntervals); 
+		cudaMalloc((void**) &(this->change_to), sizeof(float) * this->sizeX * this->sizeY * nrDepthIntervals);
+		cudaMalloc((void**) &(this->change_voxelTypes), sizeof(float) * this->sizeX * this->sizeY * nrDepthIntervals);
+
+		dim3 dimBlock_init(256);
+		dim3 dimGrid_init((this->sizeX * this->sizeY * nrDepthIntervals) / 256 + 1);
+		initFloatArray << <dimGrid_init, dimBlock_init >> > (this->change_from, activeScene->minZ - 1.0f, this->sizeX * this->sizeY * nrDepthIntervals); cudaDeviceSynchronize();
+		initFloatArray << <dimGrid_init, dimBlock_init >> > (this->change_to, activeScene->maxZ + 1.0f, this->sizeX * this->sizeY * nrDepthIntervals); cudaDeviceSynchronize();
+		initIntArray << <dimGrid_init, dimBlock_init >> > (this->change_voxelTypes, UNDEFINED, this->sizeX * this->sizeY * nrDepthIntervals); cudaDeviceSynchronize();
+
+
+		int offsetX = std::abs(oldScene->minX - activeScene->minX);
+		int offsetY = std::abs(oldScene->minY - activeScene->minY);
+
+		dim3 dimBlock(16, 16);
+		dim3 dimGrid(this->sizeX / 16 + 1, this->sizeY / 16 + 1);
+		cuda_detectChangesInterval << <dimGrid, dimBlock >> > (
+			this->change_from, this->change_to, this->change_voxelTypes,
+			activeScene->from, activeScene->to, activeScene->voxelTypes,
+			oldScene->from, oldScene->to, oldScene->voxelTypes,
+			activeScene->sizeX, activeScene->sizeY, oldScene->sizeX, oldScene->sizeY, activeScene->sizeX, activeScene->sizeY,
+			activeScene->minX, activeScene->minY, activeScene->minZ,
+			activeScene->maxX, activeScene->maxY, activeScene->maxZ,
+			oldScene->minX, oldScene->minY, oldScene->minZ,
+			oldScene->maxX, oldScene->maxY, oldScene->maxZ,
+			offsetX, offsetY
+		);
+
+		RenderChanges(activeScene, pose, intrinsics,
+			renderState, outputImage,
+			this->change_from, this->change_to, this->change_voxelTypes, activeScene->minX, activeScene->minY, activeScene->minZ, activeScene->maxX, activeScene->maxY, activeScene->maxZ,
+			type, raycastType);
+
+		float* host_change_from = new float[activeScene->sizeX * activeScene->sizeY * nrDepthIntervals];
+		float* host_change_to = new float[activeScene->sizeX * activeScene->sizeY * nrDepthIntervals];
+		int* host_change_voxelTypes = new int[activeScene->sizeX * activeScene->sizeY * nrDepthIntervals];
+
+		cudaMemcpy((void*)host_change_from, (const void*)this->change_from, sizeof(float) * activeScene->sizeX * activeScene->sizeY * nrDepthIntervals, cudaMemcpyDeviceToHost);
+		cudaMemcpy((void*)host_change_to, (const void*)this->change_to, sizeof(float) * activeScene->sizeX * activeScene->sizeY * nrDepthIntervals, cudaMemcpyDeviceToHost);
+		cudaMemcpy((void*)host_change_voxelTypes, (const void*)this->change_voxelTypes, sizeof(int) * activeScene->sizeX * activeScene->sizeY * nrDepthIntervals, cudaMemcpyDeviceToHost);
+
+
+		for (int y = 0; y < activeScene->sizeY; y++) {
+			for (int x = 0; x < activeScene->sizeX; x++) {
+
+				if (x == 75 && y == 85) {
+					char* change = " ";
+
+					for (int d = 0; d < nrDepthIntervals; d++) {
+						if (host_change_voxelTypes[x + activeScene->sizeX * y + activeScene->sizeX * activeScene->sizeY * d] == CHANGE) {
+							change = "C";
+						}
+					}
+
+					printf(change);
+				}
+			}
+			//printf("\n");
+		}
+		printf("\n");
+
+
+		cudaFree(this->change_from);
+		cudaFree(this->change_to);
+		cudaFree(this->change_voxelTypes);
+
+		free(host_change_from);
+		free(host_change_to);
+		free(host_change_voxelTypes);
+	}
+
+	//---------------------------------------------------------------------------------------------------
+
+	//------- Render Changes and Surface with Raycasting --------------------------------------------------
+	//RenderChanges(activeScene, pose, intrinsics,
+		//renderState, outputImage,
+		//this->change_from, this->change_to, this->change_voxelTypes, activeScene->minX, activeScene->minY, activeScene->minZ, activeScene->maxX, activeScene->maxY, activeScene->maxZ,
+		//type, raycastType);
+	//---------------------------------------------------------------------------------------------------
+	
+	//------- free memory -------------------------------------------------------------------------------
+	printf("Active Scene should be saved = %d\n\n", activeScene->saveMe ? 1 : 0);
+	if (!activeScene->saveMe) {
+		cudaFree(activeScene->from);
+		cudaFree(activeScene->to);
+		cudaFree(activeScene->voxelTypes);
+	}
+	//---------------------------------------------------------------------------------------------------
+
+	cudaError_t error = cudaGetLastError();
+	if (error != cudaSuccess) {
+		printf("CUDA error: %s\n", cudaGetErrorString(error));
+	}
+}
